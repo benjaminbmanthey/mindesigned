@@ -1,0 +1,1506 @@
+<!doctype html>
+<html>
+<head>
+  <!-- BASELINE: MM-2.7.2-Radial-Stable -->
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
+<title>Mindmap – MM-2.7.2-Radial-Stable</title>
+<style>
+:root{
+  --bg:#ffffff;
+  --node-bg:#ffffff;
+  --node-border:#111111;
+  --node-text:#111111;
+  --shadow: rgba(0,0,0,.10);
+  --link:#111111;
+  --node-radius:999px;
+  --node-border-w:2px;
+  --link-w:2px;
+}
+html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);font-family:system-ui}
+#viewport{position:fixed;inset:0;overflow:hidden;touch-action:none;background:var(--bg)}
+#world{position:absolute;left:0;top:0;transform-origin:0 0}
+#links{position:absolute;left:0;top:0;overflow:visible;pointer-events:none}
+
+#errorBanner{
+  position:fixed; left:10px; right:10px; top:10px;
+  z-index:5000;
+  background:#111; color:#fff;
+  padding:10px 12px;
+  border-radius:10px;
+  font: 12px/1.3 system-ui;
+  display:none;
+  white-space:pre-wrap;
+}
+
+.node{
+  position:absolute;
+  transform:translate(-50%,-50%);
+  padding:12px 18px;
+  border-radius:var(--node-radius);
+  border:var(--node-border-w) solid var(--node-border);
+  background:var(--node-bg);
+  color:var(--node-text);
+  font-weight:600;
+  white-space:nowrap;
+  user-select:none;
+  touch-action:none;
+  cursor:grab;
+  box-shadow:0 6px 18px var(--shadow);
+}
+.node:active{cursor:grabbing}
+.selected{box-shadow:0 0 0 4px rgba(0,0,0,.15),0 6px 18px var(--shadow)}
+.node.collapsed::after{ content:" ▸"; font-size:12px; opacity:.75; }
+.node.manual{ outline: none; }
+.node.droptarget{ box-shadow: 0 0 0 4px rgba(0,0,0,.28), 0 10px 28px rgba(0,0,0,.18); }
+
+path.link{
+  stroke:var(--link);
+  stroke-width:var(--link-w);
+  fill:none;
+  vector-effect:non-scaling-stroke;
+}
+
+#addBtn{
+  position:fixed;
+  width:32px;height:32px;
+  border-radius:999px;
+  border:2px solid var(--node-border);
+  background:var(--node-bg);
+  color:var(--node-text);
+  display:none;
+  place-items:center;
+  font-weight:900;
+  z-index:50;
+  user-select:none;
+  touch-action:none;
+}
+
+/* Radial overlay */
+#radialOverlay{
+  position:fixed; inset:0;
+  display:none;
+  z-index:1000;
+  touch-action:none;
+}
+#radialOverlay .dim{
+  position:absolute; inset:0;
+  background:rgba(0,0,0,.06);
+}
+#radialSvg{
+  position:absolute; left:0; top:0;
+  width:100%; height:100%;
+}
+.radialLabel{
+  font: 700 13px system-ui;
+  fill:#111;
+  pointer-events:none;
+  user-select:none;
+}
+.radialCenter{
+  font: 800 12px system-ui;
+  fill:#111;
+  opacity:.75;
+  pointer-events:none;
+}
+.radialWedge{
+  fill: rgba(255,255,255,.92);
+  stroke: rgba(0,0,0,.18);
+  stroke-width: 1;
+}
+.radialWedge.active{
+  fill: rgba(0,0,0,.08);
+}
+</style>
+</head>
+<body>
+<div id="errorBanner"></div>
+
+<div id="viewport">
+  <div id="world">
+    <svg id="links" style="overflow:visible"></svg>
+  </div>
+  <div id="addBtn">+</div>
+</div>
+
+<div id="radialOverlay">
+  <div class="dim"></div>
+  <svg id="radialSvg"></svg>
+</div>
+
+<script>
+/* BASELINE: MM-2.7.2-Radial-Stable */
+(() => {
+  /* =========================
+     Crash banner
+  ========================= */
+  const errorBanner = document.getElementById("errorBanner");
+  function showError(msg){
+    errorBanner.style.display = "block";
+    errorBanner.textContent = msg;
+  }
+  window.addEventListener("error", (e) => {
+    showError("JS error:\n" + (e.message || "unknown") + "\n" + (e.filename||"") + ":" + (e.lineno||"") );
+  });
+  window.addEventListener("unhandledrejection", (e) => {
+    showError("Promise rejection:\n" + (e.reason?.message || e.reason || "unknown"));
+  });
+
+  /* =========================
+     DOM
+  ========================= */
+  const viewport = document.getElementById("viewport");
+  const world    = document.getElementById("world");
+  const linksSvg = document.getElementById("links");
+  const addBtn   = document.getElementById("addBtn");
+  const radialOverlay = document.getElementById("radialOverlay");
+  const radialSvg = document.getElementById("radialSvg");
+
+  /* =========================
+     MODEL (declare EARLY so redraw/presets can't crash)
+  ========================= */
+  const nodes=new Map();
+  const edges=[];
+  let nextId=0;
+  let selectedId=null;
+
+  const DEFAULT_DIST=210;
+  const BASE_GAP=22;
+
+  function measure(n){
+    const w = n.el.offsetWidth || 120;
+    const h = n.el.offsetHeight || 44;
+    return {w,h};
+  }
+  function render(n){
+    n.el.style.left = n.x+"px";
+    n.el.style.top  = n.y+"px";
+  }
+  function visible(n){ return n && n.el.style.display!=="none"; }
+
+  function opposite(side){
+    if(side==="right") return "left";
+    if(side==="left")  return "right";
+    if(side==="up")    return "down";
+    return "up";
+  }
+  function sideFromAngle(angle){
+    const a = Math.atan2(Math.sin(angle), Math.cos(angle));
+    if(Math.abs(a)<Math.PI/4) return "right";
+    if(Math.abs(a)>3*Math.PI/4) return "left";
+    return a>0 ? "down" : "up";
+  }
+  function sideFromGeometry(dx,dy){
+    if(Math.abs(dx)>=Math.abs(dy)) return dx>=0 ? "right":"left";
+    return dy>=0 ? "down":"up";
+  }
+
+  /* =========================
+     GLOBAL SETTINGS + PRESETS (safe now)
+  ========================= */
+  let isEditMode = true;
+  let connectorStyle = "bezier"; // "bezier" | "elbow"
+  let bezierCurv = 60;
+
+  const PRESETS = {
+    clarity: {
+      name: "Clarity",
+      css: {
+        "--bg":"#ffffff",
+        "--node-bg":"#ffffff",
+        "--node-border":"#111111",
+        "--node-text":"#111111",
+        "--shadow":"rgba(0,0,0,.10)",
+        "--link":"#111111",
+        "--node-radius":"999px",
+        "--node-border-w":"2px",
+        "--link-w":"2px"
+      },
+      connectorStyle: "bezier",
+      bezierCurv: 60
+    },
+    structure: {
+      name: "Structure",
+      css: {
+        "--bg":"#f5f6f7",
+        "--node-bg":"#ffffff",
+        "--node-border":"#111111",
+        "--node-text":"#111111",
+        "--shadow":"rgba(0,0,0,.06)",
+        "--link":"#111111",
+        "--node-radius":"10px",
+        "--node-border-w":"2px",
+        "--link-w":"2px"
+      },
+      connectorStyle: "elbow",
+      bezierCurv: 50
+    },
+    presentation: {
+      name: "Presentation",
+      css: {
+        "--bg":"#0f1115",
+        "--node-bg":"#151922",
+        "--node-border":"#e7e9ee",
+        "--node-text":"#e7e9ee",
+        "--shadow":"rgba(0,0,0,.35)",
+        "--link":"#e7e9ee",
+        "--node-radius":"999px",
+        "--node-border-w":"2px",
+        "--link-w":"2.2px"
+      },
+      connectorStyle: "bezier",
+      bezierCurv: 70
+    }
+  };
+  let currentPresetKey = "clarity";
+
+  function applyCssVars(vars){
+    for(const k in vars){
+      document.documentElement.style.setProperty(k, vars[k]);
+    }
+  }
+  function applyPreset(key){
+    const p = PRESETS[key];
+    if(!p) return;
+    applyCssVars(p.css);
+    connectorStyle = p.connectorStyle;
+    bezierCurv = p.bezierCurv;
+    currentPresetKey = key;
+    redraw();
+  }
+  function setEditMode(on){
+    isEditMode = !!on;
+    if(!isEditMode){
+      clearSelection();
+      addBtn.style.display = "none";
+    }
+  }
+
+  /* =========================
+     CAMERA
+  ========================= */
+  let scale = 1, panX = 0, panY = 0;
+  function center(){ return {cx: viewport.clientWidth/2, cy: viewport.clientHeight/2}; }
+  function clamp(v,a,b){ return Math.max(a,Math.min(b,v)); }
+
+  function applyTransform(){
+    const {cx,cy}=center();
+    world.style.transform = `translate(${cx+panX}px, ${cy+panY}px) scale(${scale})`;
+    positionAdd();
+    redraw();
+  }
+  function screenToWorld(x,y){
+    const {cx,cy}=center();
+    return { x:(x-(cx+panX))/scale, y:(y-(cy+panY))/scale };
+  }
+  function recenter(){
+    panX = 0; panY = 0; scale = 1;
+    applyTransform();
+  }
+
+  viewport.addEventListener("wheel",(e)=>{
+    e.preventDefault();
+    const accel = (e.ctrlKey || e.metaKey) ? 1.6 : 1.0;
+    const factor = Math.exp(-e.deltaY * 0.0024 * accel);
+    const old = scale;
+    scale = clamp(scale * factor, 0.35, 4.0);
+    if(scale===old) return;
+
+    const focus = screenToWorld(e.clientX, e.clientY);
+    const {cx,cy}=center();
+    panX = e.clientX - cx - focus.x*scale;
+    panY = e.clientY - cy - focus.y*scale;
+    applyTransform();
+  },{passive:false});
+
+  /* =========================
+     HISTORY
+  ========================= */
+  let history=[];
+  let histIndex=-1;
+
+  function serializeState(){
+    const nodeList=[...nodes.values()].map(n=>({
+      id:n.id, text:n.el.textContent,
+      x:n.x, y:n.y,
+      isRoot:n.isRoot,
+      addSide:n.addSide,
+      manual:n.manual,
+      parentId:n.parentId,
+      children:[...n.children],
+      collapsed:n.collapsed,
+      display:(n.el.style.display || ""),
+      sides:{
+        right:{children:[...n.sides.get("right").children], dist:n.sides.get("right").dist, gap:n.sides.get("right").gap},
+        left :{children:[...n.sides.get("left").children],  dist:n.sides.get("left").dist,  gap:n.sides.get("left").gap},
+        up   :{children:[...n.sides.get("up").children],    dist:n.sides.get("up").dist,    gap:n.sides.get("up").gap},
+        down :{children:[...n.sides.get("down").children],  dist:n.sides.get("down").dist,  gap:n.sides.get("down").gap},
+      }
+    }));
+    const edgeList=edges.map(e=>({parent:e.parent, child:e.child, side:e.side}));
+    return JSON.stringify({ nextId, selectedId, nodeList, edgeList });
+  }
+  function clearWorldDom(){
+    for(const n of nodes.values()) n.el.remove();
+    nodes.clear();
+    edges.length=0;
+    linksSvg.innerHTML="";
+    clearSelection();
+  }
+  function loadState(json){
+    const data=JSON.parse(json);
+    clearWorldDom();
+    nextId = data.nextId || 0;
+
+    for(const nd of data.nodeList){
+      const el=document.createElement("div");
+      el.className="node";
+      el.textContent=nd.text;
+      world.appendChild(el);
+
+      const node={
+        id:nd.id, x:nd.x, y:nd.y, el,
+        isRoot:!!nd.isRoot,
+        addSide:nd.addSide || "right",
+        manual:!!nd.manual,
+        parentId:nd.parentId || null,
+        children:nd.children || [],
+        collapsed:!!nd.collapsed,
+        sides:new Map([
+          ["right",{children:(nd.sides?.right?.children||[]), dist:(nd.sides?.right?.dist??DEFAULT_DIST), gap:(nd.sides?.right?.gap??BASE_GAP)}],
+          ["left" ,{children:(nd.sides?.left?.children||[]),  dist:(nd.sides?.left?.dist??DEFAULT_DIST),  gap:(nd.sides?.left?.gap??BASE_GAP)}],
+          ["up"   ,{children:(nd.sides?.up?.children||[]),    dist:(nd.sides?.up?.dist??DEFAULT_DIST),    gap:(nd.sides?.up?.gap??BASE_GAP)}],
+          ["down" ,{children:(nd.sides?.down?.children||[]),  dist:(nd.sides?.down?.dist??DEFAULT_DIST),  gap:(nd.sides?.down?.gap??BASE_GAP)}],
+        ])
+      };
+
+      nodes.set(node.id,node);
+      if(node.manual && !node.isRoot) node.el.classList.add("manual");
+      if(node.collapsed) node.el.classList.add("collapsed");
+      node.el.style.display = nd.display || "";
+      render(node);
+    }
+
+    for(const n of nodes.values()) wireNode(n);
+    for(const e of data.edgeList) edges.push({parent:e.parent, child:e.child, side:e.side});
+
+    if(data.selectedId && nodes.has(data.selectedId) && isEditMode) selectNode(data.selectedId);
+    else clearSelection();
+
+    redraw();
+    applyTransform();
+  }
+  function commitState(){
+    const snap=serializeState();
+    if(histIndex>=0 && history[histIndex]===snap) return;
+    if(histIndex < history.length-1) history = history.slice(0, histIndex+1);
+    history.push(snap);
+    histIndex = history.length-1;
+  }
+  function undo(){
+    if(histIndex<=0) return;
+    histIndex--;
+    loadState(history[histIndex]);
+  }
+  function redo(){
+    if(histIndex>=history.length-1) return;
+    histIndex++;
+    loadState(history[histIndex]);
+  }
+  document.addEventListener("keydown",(e)=>{
+    const mod = e.ctrlKey || e.metaKey;
+    if(!mod) return;
+    if(e.key.toLowerCase()==="z" && !e.shiftKey){ e.preventDefault(); undo(); }
+    else if(e.key.toLowerCase()==="y" || (e.key.toLowerCase()==="z" && e.shiftKey)){ e.preventDefault(); redo(); }
+  });
+
+  /* =========================
+     Selection + plus
+  ========================= */
+  function clearSelection(){
+    selectedId=null;
+    nodes.forEach(n=>n.el.classList.remove("selected"));
+    addBtn.style.display="none";
+  }
+  function selectNode(id){
+    if(!isEditMode) return;
+    selectedId=id;
+    nodes.forEach(n=>n.el.classList.remove("selected"));
+    if(!id){ addBtn.style.display="none"; return; }
+    nodes.get(id).el.classList.add("selected");
+    addBtn.style.display="grid";
+    positionAdd();
+  }
+  function borderPoint(node, side){
+    const w=node.el.offsetWidth/2;
+    const h=node.el.offsetHeight/2;
+    if(side==="right") return {x:node.x+w, y:node.y};
+    if(side==="left")  return {x:node.x-w, y:node.y};
+    if(side==="down")  return {x:node.x,   y:node.y+h};
+    return {x:node.x,  y:node.y-h};
+  }
+  function pointOnPill(node, angle){
+    const w=node.el.offsetWidth/2;
+    const h=node.el.offsetHeight/2;
+    return { x: node.x + w*Math.cos(angle), y: node.y + h*Math.sin(angle) };
+  }
+  function positionAdd(){
+    if(!selectedId || !isEditMode) return;
+    const n=nodes.get(selectedId);
+    if(!n || !n.el.offsetWidth || !n.el.offsetHeight){
+      requestAnimationFrame(positionAdd);
+      return;
+    }
+    const p=borderPoint(n, n.addSide);
+    const {cx,cy}=center();
+    addBtn.style.left=(cx+panX+p.x*scale-16)+"px";
+    addBtn.style.top =(cy+panY+p.y*scale-16)+"px";
+  }
+
+  const PLUS_LONGPRESS=320;
+  let plus={down:false, dragging:false, timer:null, start:{x:0,y:0}, previewAngle:0};
+
+  addBtn.addEventListener("pointerdown",(e)=>{
+    e.stopPropagation();
+    if(!selectedId || !isEditMode) return;
+    plus.down=true; plus.dragging=false;
+    plus.start={x:e.clientX,y:e.clientY};
+    addBtn.setPointerCapture(e.pointerId);
+    plus.timer=setTimeout(()=>{ plus.dragging=true; }, PLUS_LONGPRESS);
+  });
+  addBtn.addEventListener("pointermove",(e)=>{
+    if(!plus.down || !selectedId || !isEditMode) return;
+    const moved=Math.hypot(e.clientX-plus.start.x, e.clientY-plus.start.y)>10;
+    if(moved && plus.timer){ clearTimeout(plus.timer); plus.timer=null; }
+    if(!plus.dragging) return;
+
+    const n=nodes.get(selectedId);
+    const {cx,cy}=center();
+    const nx=cx+panX+n.x*scale;
+    const ny=cy+panY+n.y*scale;
+
+    const angle=Math.atan2(e.clientY-ny, e.clientX-nx);
+    plus.previewAngle=angle;
+
+    const wp = pointOnPill(n, angle);
+    addBtn.style.left=(cx+panX+wp.x*scale-16)+"px";
+    addBtn.style.top =(cy+panY+wp.y*scale-16)+"px";
+  });
+  addBtn.addEventListener("pointerup",()=>{
+    if(plus.timer){ clearTimeout(plus.timer); plus.timer=null; }
+    if(!selectedId || !isEditMode){ plus.down=false; plus.dragging=false; return; }
+    const n=nodes.get(selectedId);
+
+    if(plus.dragging){
+      n.addSide = sideFromAngle(plus.previewAngle);
+      positionAdd();
+      commitState();
+    } else {
+      addChild(n, n.addSide);
+    }
+    plus.down=false; plus.dragging=false;
+  });
+
+  /* =========================
+     Collapse / expand
+  ========================= */
+  const TAP_MOVE_PX = 10;
+  function toggleCollapse(id){
+    const n=nodes.get(id);
+    if(!n) return;
+
+    n.collapsed = !n.collapsed;
+    if(n.collapsed){
+      n.el.classList.add("collapsed");
+      hideSubtree(id);
+    } else {
+      n.el.classList.remove("collapsed");
+      showSubtree(id);
+    }
+    if(selectedId===id) positionAdd();
+
+    layoutAndSettleNow();
+    commitState();
+  }
+  function hideSubtree(rootId){
+    const root=nodes.get(rootId);
+    if(!root) return;
+    const stack=[...root.children];
+    while(stack.length){
+      const id=stack.pop();
+      const n=nodes.get(id);
+      if(!n) continue;
+      n.el.style.display="none";
+      for(const c of n.children) stack.push(c);
+    }
+  }
+  function showSubtree(rootId){
+    const root=nodes.get(rootId);
+    if(!root) return;
+    for(const childId of root.children) revealRecursive(childId);
+  }
+  function revealRecursive(id){
+    const n=nodes.get(id);
+    if(!n) return;
+    n.el.style.display="";
+    if(n.collapsed) return;
+    for(const c of n.children) revealRecursive(c);
+  }
+
+  /* =========================
+     Create / add child
+  ========================= */
+  function createNode({text,x,y,isRoot=false, addSide="right"}){
+    const id=(++nextId)+"";
+    const el=document.createElement("div");
+    el.className="node";
+    el.textContent=text;
+    world.appendChild(el);
+
+    const node={
+      id,x,y,el,isRoot,
+      addSide,
+      manual:false,
+      parentId:null,
+      children:[],
+      collapsed:false,
+      sides:new Map([
+        ["right",{children:[], dist:DEFAULT_DIST, gap:BASE_GAP}],
+        ["left" ,{children:[], dist:DEFAULT_DIST, gap:BASE_GAP}],
+        ["up"   ,{children:[], dist:DEFAULT_DIST, gap:BASE_GAP}],
+        ["down" ,{children:[], dist:DEFAULT_DIST, gap:BASE_GAP}],
+      ])
+    };
+    nodes.set(id,node);
+    render(node);
+    wireNode(node);
+    return node;
+  }
+  function addChild(parent, side){
+    if(!isEditMode) return;
+    const child=createNode({text:"Node", x:parent.x, y:parent.y, addSide:side});
+    child.parentId=parent.id;
+    parent.children.push(child.id);
+    parent.sides.get(side).children.push(child.id);
+    edges.push({parent:parent.id, child:child.id, side});
+    child.addSide = parent.addSide;
+
+    layoutAndSettleNow();
+    commitState();
+  }
+
+  /* =========================
+     Helpers + re-parent
+  ========================= */
+  function subtreeIds(rootId){
+    const out=new Set();
+    const stack=[rootId];
+    while(stack.length){
+      const id=stack.pop();
+      if(out.has(id)) continue;
+      out.add(id);
+      const n=nodes.get(id);
+      if(!n) continue;
+      for(const c of n.children) stack.push(c);
+    }
+    return out;
+  }
+  function findEdge(parentId, childId){
+    for(const e of edges){
+      if(e.parent===parentId && e.child===childId) return e;
+    }
+    return null;
+  }
+  function removeFromArray(arr, val){
+    const i=arr.indexOf(val);
+    if(i>=0) arr.splice(i,1);
+  }
+  function clearDropTarget(){
+    nodes.forEach(n=>n.el.classList.remove("droptarget"));
+  }
+
+  const HIT_PAD = 10;
+  function nodeHitRect(n){
+    const s=measure(n);
+    const w=s.w/2 + HIT_PAD;
+    const h=s.h/2 + HIT_PAD;
+    return {l:n.x-w, r:n.x+w, t:n.y-h, b:n.y+h, cx:n.x, cy:n.y};
+  }
+  function containsPoint(r, p){
+    return p.x>=r.l && p.x<=r.r && p.y>=r.t && p.y<=r.b;
+  }
+  function pickDropTarget(worldPt, excludeSet){
+    let best=null, bestD=Infinity;
+    for(const n of nodes.values()){
+      if(!visible(n)) continue;
+      if(excludeSet.has(n.id)) continue;
+      const r=nodeHitRect(n);
+      if(!containsPoint(r, worldPt)) continue;
+      const d=Math.hypot(worldPt.x-r.cx, worldPt.y-r.cy);
+      if(d<bestD){ bestD=d; best=n; }
+    }
+    return best;
+  }
+
+  function reparentNode(movedId, newParentId){
+    if(!isEditMode) return;
+    const moved = nodes.get(movedId);
+    const newP  = nodes.get(newParentId);
+    if(!moved || !newP) return;
+
+    const oldParentId = moved.parentId;
+    if(!oldParentId) return;
+    const oldP = nodes.get(oldParentId);
+    if(!oldP) return;
+
+    const dx = moved.x - newP.x;
+    const dy = moved.y - newP.y;
+    const newSide = sideFromGeometry(dx,dy);
+
+    const oldEdge = findEdge(oldParentId, movedId);
+    const oldSide = oldEdge ? oldEdge.side : null;
+
+    removeFromArray(oldP.children, movedId);
+    if(oldSide) removeFromArray(oldP.sides.get(oldSide).children, movedId);
+
+    moved.parentId = newParentId;
+    newP.children.push(movedId);
+    newP.sides.get(newSide).children.push(movedId);
+
+    if(oldEdge){
+      oldEdge.parent = newParentId;
+      oldEdge.side   = newSide;
+    } else {
+      edges.push({parent:newParentId, child:movedId, side:newSide});
+    }
+
+    const sub = subtreeIds(movedId);
+    for(const id of sub){
+      const n = nodes.get(id);
+      if(!n || n.isRoot) continue;
+      n.manual = false;
+      n.el.classList.remove("manual");
+    }
+
+    moved.addSide = newP.addSide;
+
+    layoutAndSettleNow();
+    commitState();
+  }
+
+  /* =========================
+     Layout + settle
+  ========================= */
+  function subtreeSpan(nodeId, side){
+    const n = nodes.get(nodeId);
+    if(!n || !visible(n)) return 0;
+    const sz = measure(n);
+
+    if(n.collapsed) return (side==="left"||side==="right") ? sz.h : sz.w;
+
+    const stackAxis = (side==="left"||side==="right") ? "y" : "x";
+    const sideObj = n.sides.get(side);
+    const kids = sideObj.children.filter(id => visible(nodes.get(id)));
+    if(!kids.length) return (stackAxis==="y") ? sz.h : sz.w;
+
+    let sum = 0;
+    for(let i=0;i<kids.length;i++){
+      sum += subtreeSpan(kids[i], side) + sideObj.gap;
+    }
+    sum -= sideObj.gap;
+    return Math.max(sum, (stackAxis==="y") ? sz.h : sz.w);
+  }
+  function layoutSide(parentId, side){
+    const p = nodes.get(parentId);
+    if(!p || !visible(p) || p.collapsed) return;
+
+    const sideObj = p.sides.get(side);
+    const kids = sideObj.children.filter(id => visible(nodes.get(id)));
+    if(!kids.length) return;
+
+    const spans = kids.map(id => subtreeSpan(id, side));
+    const total = spans.reduce((a,b)=>a+b,0) + sideObj.gap*(kids.length-1);
+    let cursor = -total/2;
+
+    for(let i=0;i<kids.length;i++){
+      const child = nodes.get(kids[i]);
+      const span = spans[i];
+      const slotCenter = cursor + span/2;
+      cursor += span + sideObj.gap;
+
+      const dist = sideObj.dist;
+
+      if(!child.manual){
+        if(side==="right"){ child.x = p.x + dist; child.y = p.y + slotCenter; }
+        else if(side==="left"){ child.x = p.x - dist; child.y = p.y + slotCenter; }
+        else if(side==="down"){ child.x = p.x + slotCenter; child.y = p.y + dist; }
+        else { child.x = p.x + slotCenter; child.y = p.y - dist; }
+        render(child);
+      }
+      layoutAllSides(child.id);
+    }
+  }
+  function layoutAllSides(nodeId){
+    const n = nodes.get(nodeId);
+    if(!n || !visible(n) || n.collapsed) return;
+    layoutSide(nodeId,"right");
+    layoutSide(nodeId,"left");
+    layoutSide(nodeId,"up");
+    layoutSide(nodeId,"down");
+  }
+  function layoutFromRoot(){
+    const root = [...nodes.values()].find(n=>n.isRoot);
+    if(!root) return;
+    root.manual = true;
+    root.el.classList.remove("manual");
+    layoutAllSides(root.id);
+  }
+
+  const SET_PAD = 8;
+  const SET_ITERS = 18;
+  const SET_MAX_STEP = 12;
+
+  function rectForSettle(n){
+    const s=measure(n);
+    const w=s.w/2 + SET_PAD;
+    const h=s.h/2 + SET_PAD;
+    return {l:n.x-w, r:n.x+w, t:n.y-h, b:n.y+h, cx:n.x, cy:n.y, w, h};
+  }
+  function overlapRect(a,b){
+    return !(a.r<=b.l || a.l>=b.r || a.b<=b.t || a.t>=b.b);
+  }
+  function settleOnce(){
+    const list=[...nodes.values()].filter(n=>visible(n));
+    if(list.length<2) return false;
+
+    let moved=false;
+    for(let iter=0; iter<SET_ITERS; iter++){
+      const push=new Map();
+      for(const n of list) push.set(n.id,{x:0,y:0});
+      let had=false;
+
+      for(let i=0;i<list.length;i++){
+        for(let j=i+1;j<list.length;j++){
+          const A=list[i], B=list[j];
+          const a=rectForSettle(A), b=rectForSettle(B);
+          if(!overlapRect(a,b)) continue;
+          had=true;
+
+          const dx=a.cx-b.cx, dy=a.cy-b.cy;
+          const sdx = (dx===0 ? 1 : Math.sign(dx));
+          const sdy = (dy===0 ? 1 : Math.sign(dy));
+          const px = (a.w+b.w) - Math.abs(dx);
+          const py = (a.h+b.h) - Math.abs(dy);
+
+          let ax=0,ay=0,bx=0,by=0;
+          if(px<py){ const p=px/2; ax= sdx*p; bx=-sdx*p; }
+          else     { const p=py/2; ay= sdy*p; by=-sdy*p; }
+
+          if(A.isRoot || A.manual){ bx+=ax; by+=ay; ax=0; ay=0; }
+          if(B.isRoot || B.manual){ ax+=bx; ay+=by; bx=0; by=0; }
+
+          const pa=push.get(A.id), pb=push.get(B.id);
+          pa.x+=ax; pa.y+=ay;
+          pb.x+=bx; pb.y+=by;
+        }
+      }
+      if(!had) break;
+
+      for(const n of list){
+        if(n.isRoot || n.manual) continue;
+        const p=push.get(n.id);
+        const len=Math.hypot(p.x,p.y);
+        if(len<0.5) continue;
+        const cap=Math.min(SET_MAX_STEP,len);
+        n.x += (p.x/len)*cap;
+        n.y += (p.y/len)*cap;
+        render(n);
+        moved=true;
+      }
+    }
+    if(moved) positionAdd();
+    return moved;
+  }
+
+  function layoutAndSettleNow(){
+    layoutFromRoot();
+    for(let i=0;i<6;i++){
+      const m=settleOnce();
+      if(!m) break;
+    }
+    redraw();
+    positionAdd();
+  }
+
+  /* =========================
+     Routing
+  ========================= */
+  const ROUTE_PAD=14;
+  const SAMPLE_N=20;
+  const DETOUR_OFFSETS = [0, 60, -60, 110, -110, 170, -170, 240, -240];
+
+  function nodeRectRoute(n){
+    const s=measure(n);
+    const w=s.w/2 + ROUTE_PAD;
+    const h=s.h/2 + ROUTE_PAD;
+    return {l:n.x-w, r:n.x+w, t:n.y-h, b:n.y+h, cx:n.x, cy:n.y};
+  }
+  function pointInRect(p,r){ return (p.x>=r.l && p.x<=r.r && p.y>=r.t && p.y<=r.b); }
+
+  function defaultBezier(p,c,side){
+    const CURV = bezierCurv;
+    const s=borderPoint(p, side);
+    const t=borderPoint(c, opposite(side));
+    let c1,c2;
+    if(side==="right"){ c1={x:s.x+CURV,y:s.y}; c2={x:t.x-CURV,y:t.y}; }
+    else if(side==="left"){ c1={x:s.x-CURV,y:s.y}; c2={x:t.x+CURV,y:t.y}; }
+    else if(side==="down"){ c1={x:s.x,y:s.y+CURV}; c2={x:t.x,y:t.y-CURV}; }
+    else { c1={x:s.x,y:s.y-CURV}; c2={x:t.x,y:t.y+CURV}; }
+    return {s,c1,c2,t};
+  }
+  function cubicPoint(b,t){
+    const u=1-t, tt=t*t, uu=u*u;
+    const uuu=uu*u, ttt=tt*t;
+    return {
+      x: uuu*b.s.x + 3*uu*t*b.c1.x + 3*u*tt*b.c2.x + ttt*b.t.x,
+      y: uuu*b.s.y + 3*uu*t*b.c1.y + 3*u*tt*b.c2.y + ttt*b.t.y
+    };
+  }
+  function bezierHitsAnyNode(bezier, rects){
+    for(let i=0;i<=SAMPLE_N;i++){
+      const t=i/SAMPLE_N;
+      const p=cubicPoint(bezier,t);
+      for(const r of rects){
+        if(pointInRect(p,r)) return true;
+      }
+    }
+    return false;
+  }
+  function detouredBezier(p,c,side,rects){
+    const base = defaultBezier(p,c,side);
+    if(!bezierHitsAnyNode(base, rects)) return base;
+
+    const horizontal = (side==="left" || side==="right");
+    for(const off of DETOUR_OFFSETS){
+      if(off===0) continue;
+      const b = {
+        s: base.s, t: base.t,
+        c1: {x: base.c1.x + (horizontal ? 0 : off), y: base.c1.y + (horizontal ? off : 0)},
+        c2: {x: base.c2.x + (horizontal ? 0 : off), y: base.c2.y + (horizontal ? off : 0)}
+      };
+      if(!bezierHitsAnyNode(b, rects)) return b;
+    }
+    return base;
+  }
+
+  function elbowPath(p,c,side){
+    const s = borderPoint(p, side);
+    const t = borderPoint(c, opposite(side));
+    if(side==="left" || side==="right"){
+      const mx = (s.x + t.x)/2;
+      return `M ${s.x} ${s.y} L ${mx} ${s.y} L ${mx} ${t.y} L ${t.x} ${t.y}`;
+    } else {
+      const my = (s.y + t.y)/2;
+      return `M ${s.x} ${s.y} L ${s.x} ${my} L ${t.x} ${my} L ${t.x} ${t.y}`;
+    }
+  }
+
+  function redraw(){
+    linksSvg.innerHTML="";
+
+    const rectsById = new Map();
+    for(const [id,n] of nodes){
+      if(n.el.style.display==="none") continue;
+      rectsById.set(id, nodeRectRoute(n));
+    }
+
+    for(const e of edges){
+      const p=nodes.get(e.parent), c=nodes.get(e.child);
+      if(!p||!c) continue;
+      if(p.el.style.display==="none" || c.el.style.display==="none") continue;
+      if(p.collapsed) continue;
+
+      const dx=c.x-p.x, dy=c.y-p.y;
+      const side = sideFromGeometry(dx,dy);
+
+      const path=document.createElementNS("http://www.w3.org/2000/svg","path");
+      path.setAttribute("class","link");
+
+      if(connectorStyle==="elbow"){
+        path.setAttribute("d", elbowPath(p,c,side));
+      } else {
+        const rects=[];
+        for(const [id,r] of rectsById){
+          if(id===p.id || id===c.id) continue;
+          rects.push(r);
+        }
+        const b = detouredBezier(p,c,side,rects);
+        path.setAttribute("d", `M ${b.s.x} ${b.s.y} C ${b.c1.x} ${b.c1.y}, ${b.c2.x} ${b.c2.y}, ${b.t.x} ${b.t.y}`);
+      }
+      linksSvg.appendChild(path);
+    }
+  }
+
+  /* =========================
+     Node wiring (drag + reparent) + tap collapse
+  ========================= */
+  const DRAG_START_PX = 10;
+  let drag=null;
+  let pendingDrag=null;
+  let currentDropTargetId=null;
+
+  function wireNode(node){
+    let pressStart=null;
+node.el.addEventListener("dblclick",(e)=>{
+      if(!isEditMode) return;
+      e.stopPropagation();
+      toggleCollapse(node.id);
+    });
+
+    node.el.addEventListener("pointerdown",(e)=>{
+      e.stopPropagation();
+      pressStart={x:e.clientX,y:e.clientY};
+
+      if(!isEditMode){
+        node.el.setPointerCapture(e.pointerId);
+        return;
+      }
+
+      selectNode(node.id);
+      if(node.isRoot) return;
+
+      node.el.setPointerCapture(e.pointerId);
+      pendingDrag={
+        nodeId: node.id,
+        startX:e.clientX, startY:e.clientY,
+        lastWorld: screenToWorld(e.clientX,e.clientY),
+        movedIds:[...subtreeIds(node.id)],
+        subtreeSet: subtreeIds(node.id),
+        started:false
+      };
+    });
+
+    node.el.addEventListener("pointermove",(e)=>{
+      if(!isEditMode) return;
+      if(!pendingDrag || pendingDrag.nodeId!==node.id) return;
+
+      const movePx=Math.hypot(e.clientX-pendingDrag.startX, e.clientY-pendingDrag.startY);
+      if(!pendingDrag.started && movePx>=DRAG_START_PX){
+        pendingDrag.started=true;
+        drag=pendingDrag;
+        const n=nodes.get(drag.nodeId);
+        n.manual=true;
+        n.el.classList.add("manual");
+      }
+      if(!drag || drag.nodeId!==node.id) return;
+
+      const now=screenToWorld(e.clientX,e.clientY);
+      const dx=now.x-drag.lastWorld.x;
+      const dy=now.y-drag.lastWorld.y;
+      drag.lastWorld=now;
+
+      for(const id of drag.movedIds){
+        const n=nodes.get(id);
+        n.x+=dx; n.y+=dy;
+        render(n);
+      }
+
+      const wp = screenToWorld(e.clientX,e.clientY);
+      const target = pickDropTarget(wp, drag.subtreeSet);
+      const newId = target ? target.id : null;
+
+      if(newId !== currentDropTargetId){
+        clearDropTarget();
+        currentDropTargetId = newId;
+        if(newId) nodes.get(newId).el.classList.add("droptarget");
+      }
+
+      positionAdd();
+      redraw();
+    });
+
+    node.el.addEventListener("pointerup",(e)=>{
+      const movedTap=pressStart?Math.hypot(e.clientX-pressStart.x, e.clientY-pressStart.y):999;
+      const didDrag=!!(pendingDrag && pendingDrag.started);
+
+            if(movedTap<=TAP_MOVE_PX && !didDrag){
+        if(e.shiftKey) toggleCollapse(node.id);
+      }
+
+      if(isEditMode && drag && drag.nodeId===node.id){
+        const wp = screenToWorld(e.clientX,e.clientY);
+        const target = pickDropTarget(wp, drag.subtreeSet);
+
+        clearDropTarget();
+        currentDropTargetId=null;
+
+        if(target && target.id){
+          reparentNode(drag.nodeId, target.id);
+        } else {
+          for(let i=0;i<4;i++){
+            const m=settleOnce();
+            if(!m) break;
+          }
+          redraw();
+          positionAdd();
+          commitState();
+        }
+        drag=null;
+      }
+
+      if(pendingDrag && pendingDrag.nodeId===node.id) pendingDrag=null;
+      pressStart=null;
+    });
+
+    node.el.addEventListener("pointercancel",()=>{
+      pressStart=null;
+      clearDropTarget();
+      currentDropTargetId=null;
+      if(drag && drag.nodeId===node.id) drag=null;
+      if(pendingDrag && pendingDrag.nodeId===node.id) pendingDrag=null;
+    });
+  }
+
+  /* =========================
+     RADIAL MENU (background long press)
+  ========================= */
+  let radial = {
+    open:false,
+    level:"root", // "root" | "theme"
+    cx:0, cy:0,
+    activeIndex:-1,
+    baseSnapshot:null,
+    lastPreviewKey:null
+  };
+
+  function snapshotGlobals(){
+    const styles = getComputedStyle(document.documentElement);
+    return {
+      isEditMode,
+      presetKey: currentPresetKey,
+      connectorStyle,
+      bezierCurv,
+      cssVars: {
+        "--bg": styles.getPropertyValue("--bg").trim(),
+        "--node-bg": styles.getPropertyValue("--node-bg").trim(),
+        "--node-border": styles.getPropertyValue("--node-border").trim(),
+        "--node-text": styles.getPropertyValue("--node-text").trim(),
+        "--shadow": styles.getPropertyValue("--shadow").trim(),
+        "--link": styles.getPropertyValue("--link").trim(),
+        "--node-radius": styles.getPropertyValue("--node-radius").trim(),
+        "--node-border-w": styles.getPropertyValue("--node-border-w").trim(),
+        "--link-w": styles.getPropertyValue("--link-w").trim(),
+      }
+    };
+  }
+  function restoreGlobals(snap){
+    if(!snap) return;
+    applyCssVars(snap.cssVars);
+    connectorStyle = snap.connectorStyle;
+    bezierCurv = snap.bezierCurv;
+    currentPresetKey = snap.presetKey;
+    setEditMode(snap.isEditMode);
+    redraw();
+  }
+
+  function openRadial(x,y){
+    radial.open = true;
+    radial.level = "root";
+    radial.cx = x; radial.cy = y;
+    radial.activeIndex = -1;
+    radial.lastPreviewKey = null;
+    radial.baseSnapshot = snapshotGlobals();
+    radialOverlay.style.display = "block";
+    drawRadial();
+  }
+  function closeRadial(commit){
+    if(!commit) restoreGlobals(radial.baseSnapshot);
+    radial.open=false;
+    radialOverlay.style.display="none";
+    radialSvg.innerHTML="";
+    radial.activeIndex=-1;
+    radial.level="root";
+  }
+  function polarIndex(x,y,count){
+    const dx = x - radial.cx;
+    const dy = y - radial.cy;
+    const r = Math.hypot(dx,dy);
+    if(r < 28) return -1;
+    let ang = Math.atan2(dy,dx);
+    ang -= (-Math.PI/2);
+    while(ang<0) ang += Math.PI*2;
+    const slice = (Math.PI*2)/count;
+    return Math.max(0, Math.min(count-1, Math.floor(ang / slice)));
+  }
+  function wedgePath(cx,cy,r0,r1,a0,a1){
+    const x0 = cx + r1*Math.cos(a0), y0 = cy + r1*Math.sin(a0);
+    const x1 = cx + r1*Math.cos(a1), y1 = cy + r1*Math.sin(a1);
+    const x2 = cx + r0*Math.cos(a1), y2 = cy + r0*Math.sin(a1);
+    const x3 = cx + r0*Math.cos(a0), y3 = cy + r0*Math.sin(a0);
+    const large = (a1-a0) > Math.PI ? 1 : 0;
+    return `M ${x0} ${y0} A ${r1} ${r1} 0 ${large} 1 ${x1} ${y1}
+            L ${x2} ${y2} A ${r0} ${r0} 0 ${large} 0 ${x3} ${y3} Z`;
+  }
+  function drawRadial(){
+    radialSvg.innerHTML = "";
+    const w = window.innerWidth, h = window.innerHeight;
+    radialSvg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+
+    const items = (radial.level==="root")
+      ? ["Mode","Theme","Recenter"]
+      : ["Clarity","Structure","Presentation"];
+
+    const count = items.length;
+    const r0 = 42, r1 = 112;
+    const start = -Math.PI/2;
+    const slice = (Math.PI*2)/count;
+
+    const dark = (currentPresetKey==="presentation");
+
+    for(let i=0;i<count;i++){
+      const a0 = start + i*slice;
+      const a1 = start + (i+1)*slice;
+
+      const path = document.createElementNS("http://www.w3.org/2000/svg","path");
+      path.setAttribute("class","radialWedge"+(i===radial.activeIndex?" active":""));
+      path.setAttribute("d", wedgePath(radial.cx, radial.cy, r0, r1, a0, a1));
+      if(dark){
+        path.setAttribute("fill","rgba(21,25,34,.92)");
+        path.setAttribute("stroke","rgba(231,233,238,.22)");
+        if(i===radial.activeIndex) path.setAttribute("fill","rgba(231,233,238,.12)");
+      }
+      radialSvg.appendChild(path);
+
+      const am = (a0+a1)/2;
+      const lx = radial.cx + (r0 + (r1-r0)*0.62)*Math.cos(am);
+      const ly = radial.cy + (r0 + (r1-r0)*0.62)*Math.sin(am);
+
+      const txt = document.createElementNS("http://www.w3.org/2000/svg","text");
+      txt.setAttribute("class","radialLabel");
+      txt.setAttribute("text-anchor","middle");
+      txt.setAttribute("dominant-baseline","middle");
+      txt.setAttribute("x", lx);
+      txt.setAttribute("y", ly);
+      txt.textContent = items[i];
+      if(dark) txt.setAttribute("fill","#e7e9ee");
+      radialSvg.appendChild(txt);
+    }
+
+    const c = document.createElementNS("http://www.w3.org/2000/svg","text");
+    c.setAttribute("class","radialCenter");
+    c.setAttribute("text-anchor","middle");
+    c.setAttribute("dominant-baseline","middle");
+    c.setAttribute("x", radial.cx);
+    c.setAttribute("y", radial.cy);
+    c.textContent = (radial.level==="root") ? (isEditMode ? "EDIT" : "VIEW") : "THEME";
+    if(dark) c.setAttribute("fill","#e7e9ee");
+    radialSvg.appendChild(c);
+  }
+
+  function previewRadialSelection(idx){
+    if(idx<0) return;
+
+    if(radial.level==="root"){
+      if(idx===0){
+        setEditMode(!radial.baseSnapshot.isEditMode);
+      } else if(idx===1){
+        restoreGlobals(radial.baseSnapshot);
+      } else if(idx===2){
+        restoreGlobals(radial.baseSnapshot);
+        recenter();
+      }
+    } else {
+      const key = idx===0 ? "clarity" : idx===1 ? "structure" : "presentation";
+      if(radial.lastPreviewKey!==key){
+        restoreGlobals(radial.baseSnapshot);
+        applyPreset(key);
+        setEditMode(radial.baseSnapshot.isEditMode);
+        radial.lastPreviewKey = key;
+      }
+    }
+  }
+
+  function commitRadialSelection(idx){
+    if(idx<0){ closeRadial(false); return; }
+
+    if(radial.level==="root"){
+      if(idx===0){
+        const newMode = !radial.baseSnapshot.isEditMode;
+        restoreGlobals(radial.baseSnapshot);
+        setEditMode(newMode);
+        closeRadial(true);
+        return;
+      }
+      if(idx===1){
+        radial.level="theme";
+        radial.activeIndex=-1;
+        radial.lastPreviewKey=null;
+        drawRadial();
+        return;
+      }
+      if(idx===2){
+        restoreGlobals(radial.baseSnapshot);
+        recenter();
+        closeRadial(true);
+        return;
+      }
+    } else {
+      const key = idx===0 ? "clarity" : idx===1 ? "structure" : "presentation";
+      restoreGlobals(radial.baseSnapshot);
+      applyPreset(key);
+      setEditMode(radial.baseSnapshot.isEditMode);
+      closeRadial(true);
+      return;
+    }
+  }
+
+  radialOverlay.addEventListener("pointermove",(e)=>{
+    if(!radial.open) return;
+    const idx = polarIndex(e.clientX, e.clientY, 3);
+    if(idx !== radial.activeIndex){
+      radial.activeIndex = idx;
+      previewRadialSelection(idx);
+      drawRadial();
+    }
+  });
+  radialOverlay.addEventListener("pointerup",(e)=>{
+    if(!radial.open) return;
+    const idx = polarIndex(e.clientX, e.clientY, 3);
+    commitRadialSelection(idx);
+  });
+  radialOverlay.addEventListener("pointercancel",()=>{
+    if(!radial.open) return;
+    closeRadial(false);
+  });
+
+  /* =========================
+     Touch: pan/pinch + bg long press radial
+     (Undo/Redo gestures kept as before)
+  ========================= */
+  const ptrs = new Map();
+  let mode="none", pinchStart=null, lastPan=null;
+
+  function dist2(a,b){ return Math.hypot(a.x-b.x,a.y-b.y); }
+  function mid2(a,b){ return {x:(a.x+b.x)/2, y:(a.y+b.y)/2}; }
+
+  function isBackgroundTarget(t){
+    return (t===viewport || t===world || t===linksSvg);
+  }
+// Background tap/click clears selection (hides + and selected glow)
+  viewport.addEventListener("click",(e)=>{
+    if(!isEditMode) return;
+    if(radial.open) return;
+    if(isBackgroundTarget(e.target)){
+      clearSelection();
+    }
+  });
+  const GESTURE_MAX_MS = 260;
+  const GESTURE_MOVE_PX = 10;
+  const DOUBLE_TAP_MS = 420;
+  const DOUBLE_TAP_DIST = 28;
+  const UNDO_DELAY_MS = 230;
+
+  let gestureActive=false;
+  let gestureStartTime=0;
+  let gestureMaxFingers=0;
+  let gestureMoved=false;
+  let gestureStartPos=new Map();
+  let gestureAllowed=false;
+
+  let pendingUndoTimer=null;
+  let lastTwoFingerTap={time:0, x:0, y:0};
+
+  function cancelPendingUndo(){
+    if(pendingUndoTimer){
+      clearTimeout(pendingUndoTimer);
+      pendingUndoTimer=null;
+    }
+  }
+
+  let bgHold = { timer:null, startX:0, startY:0, pointerId:null, moved:false };
+  function startBgHold(e){
+    clearTimeout(bgHold.timer);
+    bgHold = { timer:null, startX:e.clientX, startY:e.clientY, pointerId:e.pointerId, moved:false };
+    bgHold.timer = setTimeout(()=>{
+      if(ptrs.size===1 && !bgHold.moved && !radial.open){
+        cancelPendingUndo();
+        openRadial(bgHold.startX, bgHold.startY);
+      }
+    }, 520);
+  }
+  function cancelBgHold(){
+    clearTimeout(bgHold.timer);
+    bgHold.timer=null;
+  }
+
+  viewport.addEventListener("pointerdown",(e)=>{
+    if(radial.open) return;
+
+    const bg = isBackgroundTarget(e.target);
+    const blocked = (e.target===addBtn || e.target.classList.contains("node"));
+    gestureAllowed = bg && !blocked;
+
+    viewport.setPointerCapture(e.pointerId);
+    ptrs.set(e.pointerId,{x:e.clientX,y:e.clientY});
+
+    if(bg && ptrs.size===1) startBgHold(e);
+    else cancelBgHold();
+
+    if(gestureAllowed){
+      if(ptrs.size===1){
+        gestureActive=true;
+        gestureStartTime=performance.now();
+        gestureMaxFingers=1;
+        gestureMoved=false;
+        gestureStartPos.clear();
+        gestureStartPos.set(e.pointerId,{x:e.clientX,y:e.clientY});
+      } else if(gestureActive){
+        gestureMaxFingers=Math.max(gestureMaxFingers, ptrs.size);
+        gestureStartPos.set(e.pointerId,{x:e.clientX,y:e.clientY});
+      }
+    } else {
+      gestureActive=false;
+      gestureStartPos.clear();
+    }
+
+    if(ptrs.size===1){
+      mode="pan"; lastPan=null; pinchStart=null;
+    } else if(ptrs.size===2){
+      cancelBgHold();
+      mode="pinch";
+      const pts=[...ptrs.values()];
+      const m=mid2(pts[0],pts[1]);
+      pinchStart={ d:dist2(pts[0],pts[1]), s:scale, focus:screenToWorld(m.x,m.y) };
+    }
+  },{passive:true});
+
+  viewport.addEventListener("pointermove",(e)=>{
+    if(radial.open) return;
+    if(!ptrs.has(e.pointerId)) return;
+    ptrs.set(e.pointerId,{x:e.clientX,y:e.clientY});
+
+    if(bgHold.pointerId===e.pointerId){
+      const mv = Math.hypot(e.clientX-bgHold.startX, e.clientY-bgHold.startY);
+      if(mv > 10){
+        bgHold.moved = true;
+        cancelBgHold();
+      }
+    }
+
+    if(gestureActive && gestureStartPos.has(e.pointerId)){
+      const s=gestureStartPos.get(e.pointerId);
+      if(Math.hypot(e.clientX-s.x, e.clientY-s.y) > GESTURE_MOVE_PX){
+        gestureMoved=true;
+        cancelPendingUndo();
+      }
+    }
+
+    if(mode==="pan" && ptrs.size===1){
+      const p=[...ptrs.values()][0];
+      if(!lastPan){ lastPan={x:p.x,y:p.y}; return; }
+      panX += p.x-lastPan.x;
+      panY += p.y-lastPan.y;
+      lastPan={x:p.x,y:p.y};
+      applyTransform();
+      return;
+    }
+
+    if(mode==="pinch" && ptrs.size===2 && pinchStart){
+      const pts=[...ptrs.values()];
+      const m=mid2(pts[0],pts[1]);
+      const d=dist2(pts[0],pts[1]);
+      const ratio = d/Math.max(1,pinchStart.d);
+
+      scale = clamp(pinchStart.s * ratio, 0.35, 4.0);
+      const {cx,cy}=center();
+      panX = m.x - cx - pinchStart.focus.x*scale;
+      panY = m.y - cy - pinchStart.focus.y*scale;
+      applyTransform();
+    }
+  },{passive:true});
+
+  function endPtr(e){
+    if(radial.open){
+      ptrs.delete(e.pointerId);
+      cancelBgHold();
+      return;
+    }
+
+    const wasGesture = gestureActive;
+    const maxF = gestureMaxFingers;
+    const moved = gestureMoved;
+    const dt = wasGesture ? (performance.now()-gestureStartTime) : 9999;
+
+    let centroid={x:e.clientX,y:e.clientY};
+    if(ptrs.size>=1){
+      const vals=[...ptrs.values()];
+      const avg=vals.reduce((a,p)=>({x:a.x+p.x,y:a.y+p.y}),{x:0,y:0});
+      centroid={x:avg.x/vals.length, y:avg.y/vals.length};
+    }
+
+    ptrs.delete(e.pointerId);
+    if(gestureStartPos.has(e.pointerId)) gestureStartPos.delete(e.pointerId);
+
+    if(ptrs.size===0){
+      cancelBgHold();
+      mode="none"; pinchStart=null; lastPan=null;
+
+      if(wasGesture && gestureAllowed && !moved && dt<=GESTURE_MAX_MS && maxF===2){
+        const now = performance.now();
+        const isDouble = (now - lastTwoFingerTap.time) <= DOUBLE_TAP_MS &&
+                         Math.hypot(centroid.x-lastTwoFingerTap.x, centroid.y-lastTwoFingerTap.y) <= DOUBLE_TAP_DIST;
+
+        if(isDouble){
+          cancelPendingUndo();
+          redo();
+          lastTwoFingerTap.time = 0;
+        } else {
+          cancelPendingUndo();
+          pendingUndoTimer = setTimeout(()=>{ undo(); pendingUndoTimer=null; }, UNDO_DELAY_MS);
+          lastTwoFingerTap = {time: now, x: centroid.x, y: centroid.y};
+        }
+      }
+
+      gestureActive=false;
+      gestureMoved=false;
+      gestureMaxFingers=0;
+      gestureStartPos.clear();
+      gestureAllowed=false;
+
+    } else if(ptrs.size===1){
+      mode="pan"; pinchStart=null; lastPan=null;
+    }
+  }
+  viewport.addEventListener("pointerup", endPtr);
+  viewport.addEventListener("pointercancel", endPtr);
+
+  /* =========================
+     INIT
+  ========================= */
+  function init(){
+    // Apply preset AFTER nodes exist
+    applyPreset(currentPresetKey);
+
+    const root = createNode({text:"Main Theme", x:0, y:0, isRoot:true, addSide:"right"});
+    render(root);
+    clearSelection();
+
+    requestAnimationFrame(()=>{
+      applyTransform();
+      requestAnimationFrame(()=>{
+        layoutAndSettleNow();
+        commitState();
+        applyTransform();
+      });
+    });
+  }
+
+  window.addEventListener("load", () => {
+    try { init(); }
+    catch(err){ showError("Init crashed:\n" + (err?.message || err)); }
+  });
+  window.addEventListener("resize", ()=>requestAnimationFrame(applyTransform));
+})();
+</script>
+</body>
+</html>
